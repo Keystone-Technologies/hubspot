@@ -1,0 +1,207 @@
+#!/usr/bin/env perl
+use Mojolicious::Lite;
+
+use Mojo::Pg;
+use Mojo::JSON;
+use Mojo::File 'path';
+
+use WebService::Autotask;
+
+plugin 'Config';
+plugin 'OAuth2' => app->config('oauth2');
+
+helper pg => sub { state $pg = Mojo::Pg->new(shift->config('pg')) };
+helper 'at.soap' => sub { state $at = WebService::Autotask->new(shift->config('autotask')) };
+
+my $accountType = {app->at->soap->get_picklist_options('Account', 'AccountType')};
+if ( 0 ) {
+# This is here because OR conditions aren't working and it's easiest to test that here
+warn Data::Dumper::Dumper app->at->soap->query({
+  entity => 'Resource',
+  query => [
+    {
+      operator => 'OR',
+      elements => [
+        {
+          name => 'Email',
+          expressions => [{op => 'Equals', value => 'sadams@keystonetechnologies.com'}],
+        },
+        {
+          name => 'Email2',
+          expressions => [{op => 'Equals', value => 'sadams@keystonetechnologies.com'}],
+        },
+        {
+          name => 'Email3',
+          expressions => [{op => 'Equals', value => 'sadams@keystonetechnologies.com'}],
+        },
+      ],
+    },
+  ],
+});
+}
+
+get '/' => 'index';
+
+get "/connect" => sub {
+  my $c = shift;
+  $c->delay(
+    sub {
+      my $delay = shift;
+      my $args = {redirect_uri => $c->url_for('connect')->userinfo(undef)->to_abs};
+      $c->oauth2->get_token(hubspot => $args, $delay->begin);
+    },
+    sub {
+      my ($delay, $err, $data) = @_;
+      return $c->render("connect", error => $err) unless $data->{access_token};
+      # Store the token somewhere
+      path('token')->spurt($data->{access_token});
+      $c->app->log->debug($data->{access_token});
+      return $c->redirect_to('index');
+    },
+  );
+};
+
+any '/webhook' => sub {
+  my $c = shift;
+  $c->render_later;
+  # Read the token that was stored somewhere
+  my $htoken = path('token')->slurp;
+  # Might need to push this off to a job queue (Minion)
+  foreach my $e ( @{$c->req->json} ) {
+    if ( $e->{subscriptionType} eq 'company.creation' ) {
+      my $companyId = $e->{objectId};
+      $c->ua->get("https://api.hubapi.com/companies/v2/companies/$companyId" => {Authorization => "Bearer $htoken"} => sub {
+        my ($ua, $tx) = @_;
+        my $company = $tx->result->json;
+        if ( $company->{properties} ) {
+          my $owner = $company->{properties}->{hubspot_owner_id}->{sourceId};
+          # This Autotask OR condition isn't working -- as a non-conjunction it works just fine
+          $owner = $owner ? $c->at->soap->query({
+            entity => 'Resource',
+            query => [
+              {
+                operator => 'OR',
+                elements => [
+                  {
+                    name => 'Email',
+                    expressions => [{op => 'Equals', value => $company->{properties}->{hubspot_owner_id}->{sourceId}}],
+                  },
+                  {
+                    name => 'Email2',
+                    expressions => [{op => 'Equals', value => $company->{properties}->{hubspot_owner_id}->{sourceId}}],
+                  },
+                  {
+                    name => 'Email3',
+                    expressions => [{op => 'Equals', value => $company->{properties}->{hubspot_owner_id}->{sourceId}}],
+                  },
+                ],
+              },
+            ],
+          }) : $c->config('default_owner');
+          warn $owner->{id} || $c->config('default_owner');
+          # The fields below are pulled from here:
+          #my $accountFields = app->at->soap->{at_soap}->GetFieldInfo(SOAP::Data->name('psObjectType')->value('Account'))->result->{Field};
+          #warn join "\n              ", map { $_->{Name} } sort { $a->{Name} cmp $b->{Name} } @$c;
+          my $account = {
+            AccountName => $company->{properties}->{name}->{value},
+            AccountType => $accountType->{Customer}, # or Cancellation, Prospect, Vendor, Partner, Lead, Dead
+            OwnerResourceID => $owner->{id} || $c->config('default_owner'),
+            Phone => $company->{properties}->{phone}->{value},
+            AccountNumber => $companyId, # this is the primary key between hubspot and autotask
+            #Active
+            #AdditionalAddressInformation
+            #Address1
+            #Address2
+            #AlternatePhone1
+            #AlternatePhone2
+            #AssetValue
+            #BillToAdditionalAddressInformation
+            #BillToAddress1
+            #BillToAddress2
+            #BillToAddressToUse (picklist)
+            #BillToAttention
+            BillToCity => $company->{properties}->{city}->{value},
+            #BillToCountryID (entity reference)
+            BillToState => $company->{properties}->{state}->{value},
+            BillToZipCode => $company->{properties}->{zip}->{value},
+            City => $company->{properties}->{city}->{value},
+            #ClientPortalActive (picklist)
+            #CompetitorID
+            Country => $company->{properties}->{country}->{value},
+            #CountryID (entity reference)
+            #CreateDate
+            #CurrencyID (entity reference)
+            #Fax
+            #InvoiceEmailMessageID
+            #InvoiceMethod (picklist)
+            #InvoiceNonContractItemsToParentAccount
+            #InvoiceTemplateID (entity reference)
+            #KeyAccountIcon (picklist)
+            #LastActivityDate
+            #MarketSegmentID (picklist)
+            #ParentAccountID (entity reference)
+            PostalCode => $company->{properties}->{zip}->{value},
+            #QuoteEmailMessageID
+            #QuoteTemplateID (entity reference)
+            #SICCode
+            State => $company->{properties}->{state}->{value},
+            #StockMarket
+            #StockSymbol
+            #TaskFireActive
+            #TaxExempt
+            #TaxID
+            #TaxRegionID (entity reference)
+            #TerritoryID (picklist)
+            WebAddress => $company->{properties}->{website}->{value},
+          };
+          my $create = $c->at->soap->create(bless($account, 'Account'));
+          $create ? $c->app->log->info("Account $account->{AccountName} created") : $c->app->log->error($@);
+        }
+      });
+    } elsif ( $e->{subscriptionType} eq 'company.deletion' ) {
+      my $companyId = $e->{objectId};
+      $c->app->log->info("Not deleting company $companyId");
+      #warn Data::Dumper::Dumper $c->at->soap->{at_soap}->delete(SOAP::Data->name('Entities')->value(\SOAP::Data->name('array' => @list)));
+    } elsif ( $e->{subscriptionType} eq 'company.propertyChange' ) {
+      my $companyId = $e->{objectId};
+      $c->app->log->info("Not updating company $companyId");
+    } elsif ( $e->{subscriptionType} eq 'contact.creation' ) {
+      my $contactId = $e->{objectId};
+      $c->app->log->info("Not creating contact $contactId");
+    } elsif ( $e->{subscriptionType} eq 'contact.deletion' ) {
+      my $contactId = $e->{objectId};
+      $c->app->log->info("Not deleting contact $contactId");
+    } elsif ( $e->{subscriptionType} eq 'contact.propertyChange' ) {
+      my $contactId = $e->{objectId};
+      $c->app->log->info("Not updating contact $contactId");
+    } elsif ( $e->{subscriptionType} eq 'deal.creation' ) {
+      my $dealId = $e->{objectId};
+      $c->app->log->info("Not creating deal $dealId");
+    } elsif ( $e->{subscriptionType} eq 'deal.deletion' ) {
+      my $dealId = $e->{objectId};
+      $c->app->log->info("Not deleting deal $dealId");
+    } elsif ( $e->{subscriptionType} eq 'deal.propertyChange' ) {
+      my $dealId = $e->{objectId};
+      $c->app->log->info("Not updating deal $dealId");
+    }
+  }
+  $c->render(json => {ok => Mojo::JSON::true});
+};
+
+# Mojo::IOLoop->recurring(20000 => sub { refresh_token });
+
+app->start;
+
+__DATA__
+
+@@ index.html.ep
+% layout 'default';
+% title 'Welcome';
+<%= link_to "Connect to Hubspot!", $c->oauth2->auth_url("hubspot", scope => "contacts", redirect_uri => $c->url_for('connect')->userinfo(undef)->to_abs) %>
+
+@@ layouts/default.html.ep
+<!DOCTYPE html>
+<html>
+  <head><title><%= title %></title></head>
+  <body><%= content %></body>
+</html>
