@@ -1,0 +1,18 @@
+{
+  pg => 'postgresql://hubspot@%2fvar%2frun%2fpostgresql/hubspot',
+  secrets => ['s3cret'],
+  default_owner => '12345678',
+  autotask => {
+    username => 'username',
+    password => 'password',
+    proxy => 'https://webservices5.autotask.net/atservices/1.5/atws.asmx',
+  },
+  oauth2 => {
+    hubspot => {
+      key           => "client_id",
+      secret        => "client_secret",
+      authorize_url => "https://app.hubspot.com/oauth/authorize",
+      token_url     => "https://api.hubapi.com/oauth/v1/token",
+    },
+  },
+};
